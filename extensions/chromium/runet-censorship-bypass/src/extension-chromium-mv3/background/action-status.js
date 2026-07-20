@@ -197,6 +197,34 @@
 
   }
 
+  function resolveActionIconPaths(iconPaths, runtimeApi) {
+
+    if (!runtimeApi || typeof runtimeApi.getURL !== 'function') {
+      return null;
+    }
+    try {
+      return Object.keys(iconPaths).reduce((resolved, size) => {
+        const iconUrl = new URL(runtimeApi.getURL(iconPaths[size]));
+        if (
+          iconUrl.protocol !== 'chrome-extension:' ||
+          !iconUrl.hostname ||
+          (
+            typeof runtimeApi.id === 'string' &&
+            runtimeApi.id &&
+            iconUrl.hostname !== runtimeApi.id
+          )
+        ) {
+          throw new TypeError('Runtime icon URL is invalid.');
+        }
+        resolved[size] = iconUrl.href;
+        return resolved;
+      }, {});
+    } catch (err) {
+      return null;
+    }
+
+  }
+
   async function updateStatus(status = {}, options = {}) {
 
     const actionApi = options.actionApi ||
@@ -223,7 +251,7 @@
     };
     const tabParams = tabId === null ? {} : {tabId};
     const changes = [
-      ['iconPath', 'setIcon', Object.assign({path: presentation.iconPath}, tabParams)],
+      ['iconPath', 'setIcon', null],
       ['badgeText', 'setBadgeText', Object.assign({text: presentation.badgeText}, tabParams)],
       [
         'badgeColor',
@@ -231,10 +259,27 @@
         Object.assign({color: presentation.badgeColor}, tabParams),
       ],
       ['title', 'setTitle', Object.assign({title: presentation.title}, tabParams)],
-    ].filter(([key]) => previous[key] !== presentation[key]);
-    const results = await Promise.all(changes.map(([, method, params]) =>
-      callAction(actionApi, runtimeApi, method, params),
-    ));
+    ].filter(([key]) =>
+      options.forcePresentation === true ||
+      previous[key] !== presentation[key],
+    );
+    const results = await Promise.all(changes.map(([key, method, params]) => {
+      if (key !== 'iconPath') {
+        return callAction(actionApi, runtimeApi, method, params);
+      }
+      const absoluteIconPaths = resolveActionIconPaths(
+          presentation.iconPath,
+          runtimeApi,
+      );
+      return absoluteIconPaths ?
+        callAction(
+            actionApi,
+            runtimeApi,
+            method,
+            Object.assign({path: absoluteIconPaths}, tabParams),
+        ) :
+        false;
+    }));
     const ok = results.every(Boolean);
     const next = Object.assign({}, previous);
     results.forEach((ifSucceeded, index) => {
@@ -332,6 +377,10 @@
     function mergeRefreshParams(previous, latest) {
 
       return Object.assign({}, latest, {
+        forcePresentation: Boolean(
+            previous && previous.forcePresentation ||
+            latest && latest.forcePresentation,
+        ),
         overrides: Object.assign(
             {},
             previous && previous.overrides,
@@ -377,6 +426,7 @@
             actionApi: chromeApi.action,
             runtimeApi: chromeApi.runtime,
             tabId: tab.id,
+            forcePresentation: params.forcePresentation === true,
           },
       );
 
@@ -504,7 +554,10 @@
           id: tabId,
           url: changeInfo.url || tab && tab.url || '',
         });
-        refreshFromEvent({tab: nextTab});
+        refreshFromEvent({
+          tab: nextTab,
+          forcePresentation: true,
+        });
       });
       addListener(tabs.onRemoved, (tabId, removeInfo) => {
         forgetStatus(tabId, {actionApi: chromeApi.action});

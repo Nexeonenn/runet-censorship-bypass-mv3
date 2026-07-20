@@ -6,6 +6,15 @@ const Chai = require('chai');
 const Mocha = require('mocha');
 const {loadBackgroundModules} = require('./background-modules');
 
+const TEST_EXTENSION_ID = 'action-status-test';
+const TEST_EXTENSION_ORIGIN = `chrome-extension://${TEST_EXTENSION_ID}`;
+
+function getAbsoluteIconPath(pathname) {
+
+  return `${TEST_EXTENSION_ORIGIN}/${pathname}`;
+
+}
+
 function createEvent() {
 
   const listeners = new Set();
@@ -46,13 +55,14 @@ function createHarness(options = {}) {
   const calls = [];
   const counts = {
     runtimeErrorReads: 0,
+    runtimeUrlResolutions: 0,
     stateReads: 0,
     tabQueries: 0,
     tabGets: 0,
     statusBuilds: 0,
   };
   let runtimeLastError = null;
-  const runtime = {};
+  const runtime = {id: TEST_EXTENSION_ID};
   Object.defineProperty(runtime, 'lastError', {
     get() {
 
@@ -61,6 +71,14 @@ function createHarness(options = {}) {
 
     },
   });
+  if (options.runtimeGetURL !== null) {
+    runtime.getURL = (pathname) => {
+      ++counts.runtimeUrlResolutions;
+      return typeof options.runtimeGetURL === 'function' ?
+        options.runtimeGetURL(pathname) :
+        getAbsoluteIconPath(pathname);
+    };
+  }
   let state = Object.assign({
     mode: 'auto',
     proxyApplied: true,
@@ -225,7 +243,7 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
     Chai.expect(harness.calls).to.deep.include({
       method: 'setIcon',
       params: {
-        path: {128: 'icons/default-128.png'},
+        path: {128: getAbsoluteIconPath('icons/default-128.png')},
         tabId: 2,
       },
     });
@@ -235,22 +253,73 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
 
   });
 
-  Mocha.it('refreshes status after an active-tab URL change or reload', async function() {
+  Mocha.it('reapplies the complete presentation after same-tab navigation',
+      async function() {
 
-    const harness = createHarness();
-    await harness.start();
-    harness.calls.length = 0;
+        const harness = createHarness();
+        await harness.start();
+        harness.calls.length = 0;
 
-    harness.updateTab(1, {url: 'https://changed.example/path'});
-    await waitForRefresh();
-    harness.updateTab(1, {status: 'complete'});
-    await waitForRefresh();
+        harness.updateTab(1, {url: 'https://changed.example/path'});
+        await waitForRefresh();
 
-    const titles = harness.calls.filter((call) => call.method === 'setTitle');
-    Chai.expect(titles).to.have.length(1);
-    Chai.expect(titles[0].params.title).to.include('changed.example');
+        Chai.expect(harness.calls.map((call) => call.method)).to.have.members([
+          'setIcon',
+          'setBadgeText',
+          'setBadgeBackgroundColor',
+          'setTitle',
+        ]);
+        Chai.expect(harness.calls.find((call) => call.method === 'setIcon'))
+            .to.deep.equal({
+              method: 'setIcon',
+              params: {
+                path: {128: getAbsoluteIconPath('icons/default-128.png')},
+                tabId: 1,
+              },
+            });
+        Chai.expect(harness.calls.find((call) => call.method === 'setTitle')
+            .params.title).to.include('changed.example');
 
-  });
+      });
+
+  Mocha.it('reapplies the complete presentation after a same-URL reload',
+      async function() {
+
+        const harness = createHarness();
+        await harness.start();
+        harness.calls.length = 0;
+
+        harness.updateTab(1, {status: 'complete'});
+        await waitForRefresh();
+
+        Chai.expect(harness.calls.map((call) => call.method)).to.have.members([
+          'setIcon',
+          'setBadgeText',
+          'setBadgeBackgroundColor',
+          'setTitle',
+        ]);
+        Chai.expect(harness.calls.find((call) => call.method === 'setTitle')
+            .params.title).to.include('alpha.example');
+
+      });
+
+  Mocha.it('deduplicates unchanged status after navigation reapplication',
+      async function() {
+
+        const harness = createHarness();
+        await harness.start();
+        harness.calls.length = 0;
+
+        harness.updateTab(1, {url: 'https://changed.example/path'});
+        await waitForRefresh();
+        Chai.expect(harness.calls).to.have.length(4);
+        harness.calls.length = 0;
+
+        await harness.coordinator.requestRefresh({state: harness.setState({})});
+
+        Chai.expect(harness.calls).to.deep.equal([]);
+
+      });
 
   Mocha.it('ignores URL updates from background tabs', async function() {
 
@@ -314,6 +383,54 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
 
       });
 
+  Mocha.it('rejects slow pre-navigation work after the active URL changes',
+      async function() {
+
+        let releaseOld;
+        let markOldStarted;
+        const oldStarted = new Promise((resolve) => {
+          markOldStarted = resolve;
+        });
+        const oldStatus = new Promise((resolve) => {
+          releaseOld = resolve;
+        });
+        const harness = createHarness({
+          refreshOnStart: false,
+          createStatus(url, snapshot, fallback) {
+
+            if (url.includes('alpha.example')) {
+              markOldStarted();
+              return oldStatus;
+            }
+            return fallback(url, snapshot);
+
+          },
+        });
+        await harness.start();
+        const oldRefresh = harness.coordinator.requestRefresh({});
+        await oldStarted;
+
+        harness.updateTab(1, {url: 'https://post-navigation.example/'});
+        await waitForRefresh();
+        Chai.expect(harness.calls.find((call) =>
+          call.method === 'setTitle' &&
+          call.params.title.includes('post-navigation.example'),
+        )).to.be.an('object');
+
+        releaseOld({
+          host: 'alpha.example',
+          controllable: true,
+          mode: 'proxy',
+          proxyApplied: true,
+        });
+        await oldRefresh;
+        Chai.expect(harness.calls.some((call) =>
+          call.method === 'setTitle' &&
+          call.params.title.includes('alpha.example'),
+        )).to.equal(false);
+
+      });
+
   Mocha.it('refreshes Auto, Proxy, and Direct site-rule changes immediately',
       async function() {
 
@@ -349,8 +466,8 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
         Chai.expect(harness.calls.filter((call) =>
           call.method === 'setIcon',
         ).map((call) => call.params.path)).to.deep.equal([
-          {128: 'icons/default-128.png'},
-          {128: 'icons/default-grayscale-128.png'},
+          {128: getAbsoluteIconPath('icons/default-128.png')},
+          {128: getAbsoluteIconPath('icons/default-grayscale-128.png')},
         ]);
 
       });
@@ -367,7 +484,7 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
     Chai.expect(harness.calls).to.deep.include({
       method: 'setIcon',
       params: {
-        path: {128: 'icons/default-grayscale-128.png'},
+        path: {128: getAbsoluteIconPath('icons/default-grayscale-128.png')},
         tabId: 1,
       },
     });
@@ -394,6 +511,24 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
         ]);
         Chai.expect(harness.calls.find((call) => call.method === 'setTitle')
             .params.title).to.include('alpha.example');
+
+      });
+
+  Mocha.it('resolves dynamic Action icons through runtime.getURL',
+      async function() {
+
+        const harness = createHarness();
+        await harness.start();
+
+        Chai.expect(harness.counts.runtimeUrlResolutions).to.equal(1);
+        Chai.expect(harness.calls.find((call) => call.method === 'setIcon'))
+            .to.deep.equal({
+              method: 'setIcon',
+              params: {
+                path: {128: getAbsoluteIconPath('icons/default-128.png')},
+                tabId: 1,
+              },
+            });
 
       });
 
@@ -424,6 +559,10 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
           'setBadgeBackgroundColor',
           'setTitle',
         ]);
+        Chai.expect(harness.calls.find((call) => call.method === 'setIcon')
+            .params.path).to.deep.equal({
+          128: getAbsoluteIconPath('icons/default-128.png'),
+        });
 
         harness.calls.length = 0;
         const retry = await harness.coordinator.requestRefresh({
@@ -437,6 +576,43 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
         harness.calls.length = 0;
         await harness.coordinator.requestRefresh({state: harness.setState({})});
         Chai.expect(harness.calls).to.deep.equal([]);
+
+      });
+
+  Mocha.it('fails malformed runtime icon URLs without blocking other status',
+      async function() {
+
+        const invalidResolvers = [
+          null,
+          () => '',
+          (pathname) => pathname,
+          (pathname) => `https://example.test/${pathname}`,
+          () => {
+            throw new TypeError('runtime.getURL failed');
+          },
+        ];
+        for (const runtimeGetURL of invalidResolvers) {
+          const harness = createHarness({runtimeGetURL});
+          const first = await harness.start();
+
+          Chai.expect(first).to.include({ok: false});
+          Chai.expect(first.failed).to.deep.equal(['setIcon']);
+          Chai.expect(harness.calls.map((call) => call.method)).to.have.members([
+            'setBadgeText',
+            'setBadgeBackgroundColor',
+            'setTitle',
+          ]);
+          Chai.expect(harness.calls.some((call) => call.method === 'setIcon'))
+              .to.equal(false);
+
+          harness.calls.length = 0;
+          const retry = await harness.coordinator.requestRefresh({
+            state: harness.setState({}),
+          });
+          Chai.expect(retry).to.include({ok: false});
+          Chai.expect(retry.failed).to.deep.equal(['setIcon']);
+          Chai.expect(harness.calls).to.deep.equal([]);
+        }
 
       });
 
@@ -454,6 +630,7 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
     for (let tabId = 1; tabId <= 257; ++tabId) {
       await global.mv3ActionStatus.updateStatus(status, {
         actionApi: harness.chromeApi.action,
+        runtimeApi: harness.chromeApi.runtime,
         tabId,
       });
     }
@@ -461,6 +638,7 @@ Mocha.describe('MV3 active-tab action status refresh', function() {
 
     await global.mv3ActionStatus.updateStatus(status, {
       actionApi: harness.chromeApi.action,
+      runtimeApi: harness.chromeApi.runtime,
       tabId: 1,
     });
 
