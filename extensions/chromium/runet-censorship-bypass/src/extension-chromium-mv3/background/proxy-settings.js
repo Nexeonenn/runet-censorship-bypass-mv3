@@ -139,7 +139,7 @@
 
   }
 
-  async function applyPacScript({cookedPacData}) {
+  async function applyPacScript({cookedPacData, beforeSet, ifCurrent}) {
 
     if (typeof cookedPacData !== 'string' || !cookedPacData.trim()) {
       throw createError(
@@ -147,7 +147,16 @@
           'Cooked PAC data is required before applying proxy settings.',
       );
     }
+    if (typeof beforeSet === 'function') {
+      await beforeSet();
+    }
     await assertCanControl();
+    if (typeof ifCurrent === 'function' && !ifCurrent()) {
+      throw createError(
+          'PAC_APPLY_STALE',
+          'PAC application was superseded by newer PAC settings or an operation.',
+      );
+    }
     ensureProxyApi();
 
     return new Promise((resolve, reject) => {

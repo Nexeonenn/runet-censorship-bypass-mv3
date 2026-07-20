@@ -47,6 +47,32 @@
 
   }
 
+  function getPacApplyModsIdentity(pacMods) {
+
+    const normalized = normalizePacMods(pacMods);
+    function withoutNote(entry) {
+
+      const copy = Object.assign({}, entry);
+      delete copy.note;
+      return copy;
+
+    }
+    const pacEffectiveMods = Object.assign({}, normalized, {
+      ownProxies: normalized.ownProxies.map((proxy) => Object.assign(
+          withoutNote(proxy),
+          {username: '', password: ''},
+      )),
+      whitelist: normalized.whitelist.map(withoutNote),
+      exceptions: normalized.exceptions.map(withoutNote),
+      rules: normalized.rules.map(withoutNote),
+    });
+    return stableStringify({
+      pacCookSemanticsVersion: PAC_COOK_SEMANTICS_VERSION,
+      pacMods: pacEffectiveMods,
+    });
+
+  }
+
   async function hashPacMods(pacMods) {
 
     const normalized = normalizePacMods(pacMods);
@@ -505,6 +531,7 @@ ${COOK_END}`;
     PAC_COOK_SEMANTICS_VERSION,
     buildExplicitProxyResult,
     cookPac,
+    getPacApplyModsIdentity,
     hashPacMods,
     selfTest,
   });

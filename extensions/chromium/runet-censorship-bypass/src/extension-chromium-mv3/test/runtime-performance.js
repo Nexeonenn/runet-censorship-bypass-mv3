@@ -279,7 +279,7 @@ Mocha.describe('MV3 runtime performance operation counts', function() {
           indexedDbReads: 2,
           indexedDbWrites: 2,
           storageGets: 25,
-          storageSets: 13,
+          storageSets: 12,
           tabGets: 1,
           pacDownloads: 1,
           pacCooks: 1,

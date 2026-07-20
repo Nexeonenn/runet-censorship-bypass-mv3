@@ -59,9 +59,16 @@ const PHASE_TEN_STATUS = Object.freeze({
 let pacDownloadPromise = null;
 let pacCookPromise = null;
 let proxyHealthCheckPromise = null;
+let pacProxyOperationQueue = Promise.resolve();
+let activePacApplyOperation = null;
 const proxyErrorDebounce = new Map();
 const NO_PROXY_CANDIDATE_MESSAGE =
   'No proxy is enabled. Enable Tor, WARP, or an own proxy.';
+const PAC_APPLY_STALE_ERROR = Object.freeze({
+  code: 'PAC_APPLY_STALE',
+  message: 'PAC application was superseded by newer PAC settings or an operation.',
+  details: null,
+});
 const actionStatusRefresh = mv3ActionStatus.createRefreshCoordinator({
   chromeApi: chrome,
   loadState: () => mv3State.loadState(),
@@ -101,6 +108,70 @@ function getProviderForState(state, providerKey, ifIncludeDisabled) {
       state && state.customPacProviders || [],
       {includeDisabled: ifIncludeDisabled === true},
   );
+
+}
+
+function invalidatePacApplyFreshness() {
+
+  activePacApplyOperation = null;
+
+}
+
+function beginPacApplyOperation() {
+
+  const operation = Object.freeze({});
+  activePacApplyOperation = operation;
+  return operation;
+
+}
+
+function ifPacApplyOperationIsFresh(operation) {
+
+  return activePacApplyOperation === operation;
+
+}
+
+function enqueuePacProxyOperation(operation) {
+
+  const queued = pacProxyOperationQueue.then(operation);
+  pacProxyOperationQueue = queued.catch(() => undefined);
+  return queued;
+
+}
+
+function createPacApplyFingerprint(state) {
+
+  const providerKey = state.currentPacProviderKey;
+  const provider = getProviderForState(state, providerKey, true);
+  const rawCache = state.pacCache || {};
+  const cookedCache = state.cookedPacCache || {};
+  const proxyApply = state.proxyApply || {};
+  return Object.freeze({
+    providerKey: providerKey || null,
+    providerEnabled: provider ? provider.enabled !== false : null,
+    providerUrls: provider ? JSON.stringify(provider.urls || []) : null,
+    pacModsIdentity: mv3PacCook.getPacApplyModsIdentity(state.pacMods),
+    rawProviderKey: rawCache.providerKey || null,
+    rawPacSha256: rawCache.rawPacSha256 || null,
+    rawArtifactRef: rawCache.artifactRef || null,
+    cookedProviderKey: cookedCache.providerKey || null,
+    sourceRawPacSha256: cookedCache.sourceRawPacSha256 || null,
+    pacModsSha256: cookedCache.pacModsSha256 || null,
+    cookedPacSha256: cookedCache.cookedPacSha256 || null,
+    cookedArtifactRef: cookedCache.artifactRef || null,
+    proxyClearState: ['clearing', 'cleared'].includes(proxyApply.status) ?
+      JSON.stringify({
+        status: proxyApply.status,
+        clearedAt: proxyApply.clearedAt || null,
+      }) :
+      null,
+  });
+
+}
+
+function ifPacApplyFingerprintsMatch(left, right) {
+
+  return Object.keys(left).every((key) => left[key] === right[key]);
 
 }
 
@@ -207,6 +278,12 @@ async function updateCustomPacProvider(params) {
     JSON.stringify(provider.urls);
   const ifSelected = state.currentPacProviderKey === key;
   const selectedProviderCleared = ifSelected && !provider.enabled;
+  if (
+    ifSelected &&
+    (urlsChanged || previous.enabled !== provider.enabled)
+  ) {
+    invalidatePacApplyFreshness();
+  }
   const nextProviders = state.customPacProviders.slice();
   nextProviders[index] = provider;
   let nextState = await mv3State.saveStatePatch({
@@ -260,6 +337,9 @@ async function deleteCustomPacProvider(params) {
     );
   }
   const selectedProviderCleared = state.currentPacProviderKey === key;
+  if (selectedProviderCleared) {
+    invalidatePacApplyFreshness();
+  }
   let nextState = await mv3State.saveStatePatch({
     customPacProviders: state.customPacProviders.filter((item) =>
       item.key !== key,
@@ -336,6 +416,16 @@ const RPC_METHODS = Object.freeze({
 
         return mv3ProxyHealth.getCandidateFingerprint(previousPacMods) !==
           mv3ProxyHealth.getCandidateFingerprint(nextPacMods);
+
+      },
+      onBeforeSave(previousPacMods, nextPacMods) {
+
+        if (
+          mv3PacCook.getPacApplyModsIdentity(previousPacMods) !==
+          mv3PacCook.getPacApplyModsIdentity(nextPacMods)
+        ) {
+          invalidatePacApplyFreshness();
+        }
 
       },
     });
@@ -431,6 +521,9 @@ const RPC_METHODS = Object.freeze({
     ) {
       throw new TypeError('Unknown PAC provider.');
     }
+    if (providerKey !== currentState.currentPacProviderKey) {
+      invalidatePacApplyFreshness();
+    }
     const state = await mv3State.setCurrentPacProvider(providerKey);
     await mv3State.resetProxyHealth();
     await scheduleAutomaticPacUpdateCheck('provider-change');
@@ -471,6 +564,7 @@ const RPC_METHODS = Object.freeze({
 
   async resetMv3State() {
 
+    invalidatePacApplyFreshness();
     await mv3State.resetState();
     return {ok: true};
 
@@ -724,6 +818,14 @@ const RPC_METHODS = Object.freeze({
 
   applyLegacyMigration(params = {}) {
 
+    if (
+      Array.isArray(params.fields) &&
+      params.fields.some((field) =>
+        ['currentPacProviderKey', 'pacMods'].includes(field),
+      )
+    ) {
+      invalidatePacApplyFreshness();
+    }
     return mv3LegacyMigrationApply.applyLegacyMigration(params);
 
   },
@@ -1154,6 +1256,7 @@ async function persistPopupDraft(tabUrl, draft) {
     if (providerKey !== null && !getProviderForState(state, providerKey)) {
       throw new TypeError('Unknown PAC provider.');
     }
+    invalidatePacApplyFreshness();
     state = await mv3State.setCurrentPacProvider(providerKey);
     await mv3State.resetProxyHealth();
     await scheduleAutomaticPacUpdateCheck('popup-provider-change');
@@ -1171,6 +1274,12 @@ async function persistPopupDraft(tabUrl, draft) {
   const nextSiteMode = target.controllable ?
     getPopupHostRuleState(pacMods, target.host).mode :
     'auto';
+  if (
+    mv3PacCook.getPacApplyModsIdentity(previousPacMods) !==
+    mv3PacCook.getPacApplyModsIdentity(pacMods)
+  ) {
+    invalidatePacApplyFreshness();
+  }
   return mv3State.savePacMods(pacMods, {
     resetProxyHealth:
       candidateFingerprint !==
@@ -1964,6 +2073,14 @@ async function applyPeriodicUpdateIfStillSafe(
 
   const apply = await applyCookedPacAndPersist({});
   if (apply.ok === false) {
+    if (apply.status === 'stale') {
+      return {
+        allowed: true,
+        status: 'stale',
+        applied: false,
+        error: apply.error,
+      };
+    }
     return {
       allowed: true,
       status: 'error',
@@ -2105,6 +2222,45 @@ function createProxyFailure(code, message, metadata = {}) {
     },
     warnings: metadata.warnings || [],
   }, metadata);
+
+}
+
+function createPacApplyStaleError() {
+
+  return createStructuredError(
+      PAC_APPLY_STALE_ERROR.code,
+      PAC_APPLY_STALE_ERROR.message,
+  );
+
+}
+
+function createPacApplyStaleResult() {
+
+  return {
+    ok: false,
+    status: 'stale',
+    applied: false,
+    error: PAC_APPLY_STALE_ERROR,
+    warnings: [],
+  };
+
+}
+
+async function assertPacApplyIsFresh(operation, fingerprint) {
+
+  if (!ifPacApplyOperationIsFresh(operation)) {
+    throw createPacApplyStaleError();
+  }
+  const latestState = await mv3State.loadState();
+  if (
+    !ifPacApplyOperationIsFresh(operation) ||
+    !ifPacApplyFingerprintsMatch(
+        fingerprint,
+        createPacApplyFingerprint(latestState),
+    )
+  ) {
+    throw createPacApplyStaleError();
+  }
 
 }
 
@@ -2605,7 +2761,7 @@ async function handleProxySettingsChanged() {
 
 async function handlePacOperationResult(result, fallbackMessage) {
 
-  if (result && result.ok === false) {
+  if (result && result.ok === false && result.status !== 'stale') {
     const error = result.error || {};
     await notifyErrorIfEnabled(
         'pacError',
@@ -2619,7 +2775,7 @@ async function handlePacOperationResult(result, fallbackMessage) {
 
 async function handleProxyOperationResult(result, fallbackMessage) {
 
-  if (result && result.ok === false) {
+  if (result && result.ok === false && result.status !== 'stale') {
     const error = result.error || {};
     await notifyErrorIfEnabled(
         'extError',
@@ -2659,6 +2815,7 @@ async function notifyErrorIfEnabled(type, title, message) {
 
 async function clearPacCacheAndArtifacts() {
 
+  invalidatePacApplyFreshness();
   const cache = await mv3State.getPacCache();
   if (cache.providerKey && cache.rawPacSha256) {
     try {
@@ -2683,6 +2840,7 @@ async function clearPacCacheAndArtifacts() {
 
 async function clearCookedPacCacheAndArtifacts() {
 
+  invalidatePacApplyFreshness();
   const cache = await mv3State.getCookedPacCache();
   if (cache.providerKey && cache.cookedPacSha256) {
     try {
@@ -2706,7 +2864,16 @@ async function clearCookedPacCacheAndArtifacts() {
 
 }
 
-async function persistProxyFailure(code, message, metadata = {}) {
+async function persistProxyFailure(
+    code,
+    message,
+    metadata = {},
+    operation = null,
+) {
+
+  if (operation && !ifPacApplyOperationIsFresh(operation)) {
+    return createPacApplyStaleResult();
+  }
 
   const error = {
     code,
@@ -2716,6 +2883,9 @@ async function persistProxyFailure(code, message, metadata = {}) {
   const proxyApply = await mv3State.setProxyApplyState(
       createProxyApplyState('error', Object.assign({}, metadata, {error})),
   );
+  if (operation && !ifPacApplyOperationIsFresh(operation)) {
+    return createPacApplyStaleResult();
+  }
   return Object.assign(
       createProxyFailure(code, message, metadata),
       {proxyApply},
@@ -2723,15 +2893,33 @@ async function persistProxyFailure(code, message, metadata = {}) {
 
 }
 
-async function applyCookedPacAndPersist(params) {
+function applyCookedPacAndPersist(params = {}) {
+
+  const operation = beginPacApplyOperation();
+  return enqueuePacProxyOperation(() =>
+    applyCookedPacAndPersistForOperation(params, operation),
+  ).finally(() => {
+    if (activePacApplyOperation === operation) {
+      activePacApplyOperation = null;
+    }
+  });
+
+}
+
+async function applyCookedPacAndPersistForOperation(params, operation) {
 
   const state = await mv3State.loadState();
+  if (!ifPacApplyOperationIsFresh(operation)) {
+    return createPacApplyStaleResult();
+  }
   const providerKey = state.currentPacProviderKey;
   const cache = state.cookedPacCache;
   if (!providerKey) {
     return persistProxyFailure(
         'VALIDATION_ERROR',
         'Select a PAC provider before applying proxy settings.',
+        {},
+        operation,
     );
   }
   if (!cache.cookedPacSha256) {
@@ -2739,6 +2927,7 @@ async function applyCookedPacAndPersist(params) {
         'COOKED_PAC_MISSING',
         'Cook PAC before applying proxy settings.',
         {providerKey},
+        operation,
     );
   }
   if (cache.providerKey !== providerKey) {
@@ -2750,10 +2939,14 @@ async function applyCookedPacAndPersist(params) {
           cookedPacSha256: cache.cookedPacSha256,
           details: {cachedProviderKey: cache.providerKey},
         },
+        operation,
     );
   }
 
   const stale = await getCookedPacStaleness(state);
+  if (!ifPacApplyOperationIsFresh(operation)) {
+    return createPacApplyStaleResult();
+  }
   const warnings = [];
   if (stale.stale) {
     if (!params.force) {
@@ -2765,6 +2958,7 @@ async function applyCookedPacAndPersist(params) {
             cookedPacSha256: cache.cookedPacSha256,
             details: {reasons: stale.reasons},
           },
+          operation,
       );
     }
     warnings.push(`Forced stale cooked PAC apply: ${stale.reasons.join(', ')}.`);
@@ -2780,6 +2974,7 @@ async function applyCookedPacAndPersist(params) {
           cookedPacSha256: cache.cookedPacSha256,
           details: control.error.details,
         },
+        operation,
     );
   }
   if (!control.canControl) {
@@ -2794,15 +2989,12 @@ async function applyCookedPacAndPersist(params) {
             error: control.error,
           },
         },
+        operation,
     );
   }
 
-  await mv3State.setProxyApplyState(createProxyApplyState('applying', {
-    providerKey,
-    cookedPacSha256: cache.cookedPacSha256,
-    levelOfControl: control.levelOfControl,
-    warnings,
-  }));
+  const fingerprint = createPacApplyFingerprint(state);
+  let latestProxyControl = control;
 
   try {
     const cookedArtifact = await mv3PacArtifacts.getCookedPacArtifact({
@@ -2818,26 +3010,54 @@ async function applyCookedPacAndPersist(params) {
     }
     await mv3ProxySettings.applyPacScript({
       cookedPacData: cookedArtifact.cookedPacData,
+      beforeSet: () => assertPacApplyIsFresh(operation, fingerprint),
+      ifCurrent: () => ifPacApplyOperationIsFresh(operation),
     });
+    if (!ifPacApplyOperationIsFresh(operation)) {
+      return createPacApplyStaleResult();
+    }
     const appliedAt = Date.now();
-    const proxyControl = await refreshProxyControlAndPersist();
+    latestProxyControl = await refreshProxyControlAndPersist();
+    if (!ifPacApplyOperationIsFresh(operation)) {
+      return createPacApplyStaleResult();
+    }
+    if (
+      latestProxyControl.controlledByThisExtension !== true ||
+      !latestProxyControl.rawValue ||
+      latestProxyControl.rawValue.mode !== 'pac_script'
+    ) {
+      throw createStructuredError(
+          'PROXY_CONTROL_LOST',
+          'Proxy control changed before PAC application could be confirmed.',
+          {levelOfControl: latestProxyControl.levelOfControl},
+      );
+    }
     const proxyApply = await mv3State.setProxyApplyState(
         createProxyApplyState('applied', {
           providerKey,
           cookedPacSha256: cache.cookedPacSha256,
           appliedAt,
-          levelOfControl: proxyControl.levelOfControl,
+          levelOfControl: latestProxyControl.levelOfControl,
           warnings,
         }),
     );
+    if (!ifPacApplyOperationIsFresh(operation)) {
+      return createPacApplyStaleResult();
+    }
     return {
       ok: true,
       status: 'applied',
       proxyApply,
-      proxyControl,
+      proxyControl: latestProxyControl,
       stale,
     };
   } catch (err) {
+    if (
+      (err && err.code === 'PAC_APPLY_STALE') ||
+      !ifPacApplyOperationIsFresh(operation)
+    ) {
+      return createPacApplyStaleResult();
+    }
     const error = normalizeProxyError(
         err,
         'PROXY_SET_FAILED',
@@ -2847,11 +3067,14 @@ async function applyCookedPacAndPersist(params) {
         createProxyApplyState('error', {
           providerKey,
           cookedPacSha256: cache.cookedPacSha256,
-          levelOfControl: control.levelOfControl,
+          levelOfControl: latestProxyControl.levelOfControl,
           error,
           warnings,
         }),
     );
+    if (!ifPacApplyOperationIsFresh(operation)) {
+      return createPacApplyStaleResult();
+    }
     return Object.assign(
         createProxyFailure(error.code, error.message, {
           providerKey,
@@ -2865,7 +3088,14 @@ async function applyCookedPacAndPersist(params) {
 
 }
 
-async function clearProxyAndPersist() {
+function clearProxyAndPersist() {
+
+  invalidatePacApplyFreshness();
+  return enqueuePacProxyOperation(clearProxyAndPersistForOperation);
+
+}
+
+async function clearProxyAndPersistForOperation() {
 
   const state = await mv3State.loadState();
   const control = await refreshProxyControlAndPersist();
@@ -3048,8 +3278,20 @@ async function downloadPacAndPersist(params) {
       );
     }
 
+    const nextPacCache = createPacCacheFromDownload(
+        result,
+        rawArtifact,
+        finishedAt,
+    );
+    if (
+      state.pacCache.providerKey !== nextPacCache.providerKey ||
+      state.pacCache.rawPacSha256 !== nextPacCache.rawPacSha256 ||
+      state.pacCache.artifactRef !== nextPacCache.artifactRef
+    ) {
+      invalidatePacApplyFreshness();
+    }
     const nextState = await mv3State.saveStatePatch({
-      pacCache: createPacCacheFromDownload(result, rawArtifact, finishedAt),
+      pacCache: nextPacCache,
       pacDownload: createPacDownloadState(
           'success',
           Object.assign({}, result, {
@@ -3301,12 +3543,25 @@ async function cookPacAndPersist(params) {
       );
     }
 
+    const nextCookedPacCache = createCookedPacCacheFromCook(
+        result,
+        cookedArtifact,
+        finishedAt,
+    );
+    if (
+      state.cookedPacCache.providerKey !== nextCookedPacCache.providerKey ||
+      state.cookedPacCache.sourceRawPacSha256 !==
+        nextCookedPacCache.sourceRawPacSha256 ||
+      state.cookedPacCache.pacModsSha256 !==
+        nextCookedPacCache.pacModsSha256 ||
+      state.cookedPacCache.cookedPacSha256 !==
+        nextCookedPacCache.cookedPacSha256 ||
+      state.cookedPacCache.artifactRef !== nextCookedPacCache.artifactRef
+    ) {
+      invalidatePacApplyFreshness();
+    }
     const nextState = await mv3State.saveStatePatch({
-      cookedPacCache: createCookedPacCacheFromCook(
-          result,
-          cookedArtifact,
-          finishedAt,
-      ),
+      cookedPacCache: nextCookedPacCache,
       pacCook: createPacCookState('success', Object.assign({}, result, {
         startedAt,
         finishedAt,

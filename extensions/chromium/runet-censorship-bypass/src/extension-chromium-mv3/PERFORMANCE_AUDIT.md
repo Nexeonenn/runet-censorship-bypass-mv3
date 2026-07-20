@@ -29,7 +29,7 @@ means tab lookups/action API calls; `C/H` means PAC cooks/hash operations; and
 | Current site Auto to Proxy | RPC 1; G/S 5/2; T/A 1/3; H 2 | RPC 1; G/S 3/1; T/A 1/3; H 2 | PAC modifiers and health reset are one serialized state mutation. |
 | Current site Proxy to Direct | RPC 1; G/S 5/2; T/A 1/1; H 2 | RPC 1; G/S 3/1; T/A 1/1; H 2 | Same batching; routing result is unchanged. |
 | Current site Direct to Auto | RPC 1; G/S 5/2; T/A 1/3; H 2 | RPC 1; G/S 3/1; T/A 1/3; H 2 | Same batching; the override is removed normally. |
-| PAC refresh, changed content | RPC 1; G/S 29/16; IDB R/W 2/2; C/H 1/9; PR/PW 4/1; tab gets 2 | RPC 1; G/S 25/13; IDB R/W 2/2; C/H 1/7; PR/PW 4/1; tab gets 1 | Complete download, cook, persistence, live-control checks, and apply remain. Writes are batched and the duplicate final action refresh is removed. |
+| PAC refresh, changed content | RPC 1; G/S 29/16; IDB R/W 2/2; C/H 1/9; PR/PW 4/1; tab gets 2 | RPC 1; G/S 25/12; IDB R/W 2/2; C/H 1/7; PR/PW 4/1; tab gets 1 | Complete download, cook, persistence, final durable-fingerprint validation, live-control checks, and apply remain. The final freshness read replaces the transient `applying` write, so reads and hashes do not increase and one state write is avoided. |
 | PAC refresh, identical HTTP 200 content | RPC 1; G/S 29/16; IDB R/W 2/2; C/H 1/9; PR/PW 4/1; tab gets 2 | RPC 1; G/S 18/7; IDB R/W 2/0; C/H 0/5; PR/PW 1/0; tab gets 1 | Existing raw and cooked artifacts are verified, no artifact is rewritten, no cook runs, and unchanged PAC is not reapplied. |
 | PAC metadata/artifact clear | RPC 2; G/S 6/2; IDB R/W 0/2; T/A 2/6; H 1 | unchanged | Both durable artifacts and both metadata records are deliberately removed. |
 | External proxy-control change | G/S 5/2; T/A 1/4; H 1; PR/PW 1/0 | unchanged | Live state is persisted, health is reset, and the active action is refreshed. |
@@ -71,7 +71,8 @@ writes, one cook, seven hashes, four proxy reads, and one proxy write).
   periodic timestamps, and checks live proxy control before deciding not to
   reapply. This avoids trusting stale memory or metadata.
 - Changed automatic apply retains all repeated live-control and staleness checks
-  at the security boundary. It still uses `mandatory: false`.
+  at the security boundary and adds a final narrow durable fingerprint before
+  the last live-control read. It still uses `mandatory: false`.
 - Popup and settings pages keep one authoritative initialization RPC. Settings
   mutations still request a fresh complete snapshot after the mutation because
   alarm, proxy, and periodic metadata may change concurrently.

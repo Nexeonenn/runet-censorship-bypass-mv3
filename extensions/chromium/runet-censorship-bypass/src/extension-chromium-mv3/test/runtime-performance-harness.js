@@ -151,8 +151,16 @@ async function createRuntimeHarness(options = {}) {
   };
   let databaseOpened = false;
   let downloadResult = null;
+  let pacDownloadGate = null;
+  let markPacDownloadStarted = null;
+  let pacCookGate = null;
+  let markPacCookStarted = null;
   let cookedArtifactReadGate = null;
   let markCookedArtifactReadStarted = null;
+  let proxySettingsReadGate = null;
+  let proxySettingsSetGate = null;
+  let nextProxySettingsSetError = null;
+  const proxySettingsSetValues = [];
   let proxyDetails = {
     levelOfControl: 'controlled_by_this_extension',
     value: {
@@ -248,17 +256,50 @@ async function createRuntimeHarness(options = {}) {
         get(details, callback) {
 
           ++counts.proxySettingsReads;
+          if (
+            proxySettingsReadGate &&
+            counts.proxySettingsReads === proxySettingsReadGate.target
+          ) {
+            proxySettingsReadGate.markStarted();
+            proxySettingsReadGate.promise.then(() => {
+              callback(clone(proxyDetails));
+            });
+            return;
+          }
           callback(clone(proxyDetails));
 
         },
         set(details, callback) {
 
           ++counts.proxySettingsWrites;
-          proxyDetails = {
-            levelOfControl: 'controlled_by_this_extension',
-            value: clone(details.value),
+          proxySettingsSetValues.push(clone(details.value));
+          const gated = proxySettingsSetGate &&
+            counts.proxySettingsWrites === proxySettingsSetGate.target ?
+            proxySettingsSetGate :
+            null;
+          const errorMessage = gated ?
+            gated.errorMessage :
+            nextProxySettingsSetError;
+          nextProxySettingsSetError = null;
+          if (!errorMessage) {
+            proxyDetails = {
+              levelOfControl: 'controlled_by_this_extension',
+              value: clone(details.value),
+            };
+          }
+          const finish = () => {
+            chromeApi.runtime.lastError = errorMessage ?
+              {message: errorMessage} :
+              null;
+            callback();
+            chromeApi.runtime.lastError = null;
           };
-          callback();
+          if (gated) {
+            gated.markStarted();
+            gated.promise.then(finish);
+            return;
+          }
+          finish();
 
         },
         clear(details, callback) {
@@ -432,6 +473,10 @@ async function createRuntimeHarness(options = {}) {
     async cookPac(params) {
 
       ++counts.pacCooks;
+      if (pacCookGate) {
+        markPacCookStarted();
+        await pacCookGate;
+      }
       return realPacCook.cookPac(params);
 
     },
@@ -542,6 +587,9 @@ async function createRuntimeHarness(options = {}) {
       nextRunAt: seedAt + 12 * 60 * 60 * 1000,
     },
   };
+  if (options.initialState) {
+    storageData.mv3State = clone(options.initialState);
+  }
 
   function countIndexedDb(type) {
 
@@ -628,6 +676,10 @@ async function createRuntimeHarness(options = {}) {
     async downloadPac() {
 
       ++counts.pacDownloads;
+      if (pacDownloadGate) {
+        markPacDownloadStarted();
+        await pacDownloadGate;
+      }
       const result = downloadResult || createDownloadResult(RAW_PAC);
       if (result.ok && result.status === 'success') {
         ++counts.hashOperations;
@@ -645,10 +697,13 @@ async function createRuntimeHarness(options = {}) {
   Vm.runInContext(`${serviceWorkerSource}\nself.__runtimeAudit = {\n` +
     '  RPC_METHODS,\n' +
     '  actionStatusRecoveryPromise,\n' +
+    '  applyCookedPacAndPersist,\n' +
     '  applyPeriodicUpdateIfStillSafe,\n' +
     '  clearCookedPacCacheAndArtifacts,\n' +
     '  clearPacCacheAndArtifacts,\n' +
+    '  clearProxyAndPersist,\n' +
     '  cookPacAndPersist,\n' +
+    '  createPacApplyFingerprint,\n' +
     '  createErrorResponse,\n' +
     '  downloadPacAndPersist,\n' +
     '  executePeriodicUpdatePipeline,\n' +
@@ -740,10 +795,168 @@ async function createRuntimeHarness(options = {}) {
       return {release, started};
 
     },
+    blockPacCook() {
+
+      let release;
+      const started = new Promise((resolve) => {
+        markPacCookStarted = resolve;
+      });
+      pacCookGate = new Promise((resolve) => {
+        release = () => {
+          pacCookGate = null;
+          markPacCookStarted = null;
+          resolve();
+        };
+      });
+      return {release, started};
+
+    },
+    blockPacDownload() {
+
+      let release;
+      const started = new Promise((resolve) => {
+        markPacDownloadStarted = resolve;
+      });
+      pacDownloadGate = new Promise((resolve) => {
+        release = () => {
+          pacDownloadGate = null;
+          markPacDownloadStarted = null;
+          resolve();
+        };
+      });
+      return {release, started};
+
+    },
+    blockProxySettingsRead(offset = 1) {
+
+      let release;
+      let markStarted;
+      const started = new Promise((resolve) => {
+        markStarted = resolve;
+      });
+      const promise = new Promise((resolve) => {
+        release = () => {
+          proxySettingsReadGate = null;
+          resolve();
+        };
+      });
+      proxySettingsReadGate = {
+        markStarted,
+        promise,
+        target: counts.proxySettingsReads + offset,
+      };
+      return {release, started};
+
+    },
+    blockProxySettingsSetCallback(options = {}) {
+
+      let release;
+      let markStarted;
+      const started = new Promise((resolve) => {
+        markStarted = resolve;
+      });
+      const promise = new Promise((resolve) => {
+        release = () => {
+          proxySettingsSetGate = null;
+          resolve();
+        };
+      });
+      proxySettingsSetGate = {
+        errorMessage: options.errorMessage || null,
+        markStarted,
+        promise,
+        target: counts.proxySettingsWrites + (options.offset || 1),
+      };
+      return {release, started};
+
+    },
     createDownloadResult,
     getState() {
 
       return clone(storageData.mv3State);
+
+    },
+    getProxyDetails() {
+
+      return clone(proxyDetails);
+
+    },
+    getProxySettingsSetValues() {
+
+      return clone(proxySettingsSetValues);
+
+    },
+    failNextProxySettingsSet(message) {
+
+      nextProxySettingsSetError = message;
+
+    },
+    async installPacVersion(options = {}) {
+
+      const providerKey = options.providerKey || 'Антизапрет';
+      const rawPacData = options.rawPacData || RAW_PAC;
+      const nextPacMods = context.mv3PacMods.normalizePacMods(
+          options.pacMods || storageData.mv3State.pacMods,
+      );
+      const nextRawPacSha256 = sha256(rawPacData);
+      const provider = context.mv3Providers.getProviderByKey(
+          providerKey,
+          storageData.mv3State.customPacProviders || [],
+      );
+      const cooked = await realPacCook.cookPac({
+        rawPacData,
+        pacMods: nextPacMods,
+        provider,
+        sourceRawPacSha256: nextRawPacSha256,
+      });
+      const installedAt = Date.now();
+      const nextRawArtifactRef =
+        `raw:${encodeURIComponent(providerKey)}:${nextRawPacSha256}`;
+      const nextCookedArtifactRef =
+        `cooked:${encodeURIComponent(providerKey)}:${cooked.cookedPacSha256}`;
+      rawArtifacts.set(nextRawArtifactRef, {
+        artifactRef: nextRawArtifactRef,
+        providerKey,
+        url: 'https://example.invalid/provider.pac',
+        rawPacData,
+        rawPacSha256: nextRawPacSha256,
+        rawPacSize: rawPacData.length,
+        fetchedAt: installedAt,
+      });
+      cookedArtifacts.set(nextCookedArtifactRef, {
+        artifactRef: nextCookedArtifactRef,
+        providerKey,
+        cookedPacData: cooked.cookedPacData,
+        cookedPacSha256: cooked.cookedPacSha256,
+        cookedPacSize: cooked.cookedContentLength,
+        sourceRawPacSha256: nextRawPacSha256,
+        pacModsSha256: cooked.pacModsSha256,
+        cookedAt: installedAt,
+        warnings: cooked.warnings,
+      });
+      await context.mv3State.saveStatePatch({
+        currentPacProviderKey: providerKey,
+        pacMods: nextPacMods,
+        pacCache: {
+          providerKey,
+          url: 'https://example.invalid/provider.pac',
+          fetchedAt: installedAt,
+          rawPacSha256: nextRawPacSha256,
+          rawPacSize: rawPacData.length,
+          artifactRef: nextRawArtifactRef,
+        },
+        cookedPacCache: {
+          providerKey,
+          cookedAt: installedAt,
+          sourceRawPacSha256: nextRawPacSha256,
+          pacModsSha256: cooked.pacModsSha256,
+          cookedPacSha256: cooked.cookedPacSha256,
+          cookedPacSize: cooked.cookedContentLength,
+          warnings: cooked.warnings,
+          artifactRef: nextCookedArtifactRef,
+        },
+      });
+      return clone(cooked);
 
     },
     dropCookedArtifact() {

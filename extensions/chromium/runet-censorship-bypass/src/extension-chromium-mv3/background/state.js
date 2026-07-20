@@ -1396,6 +1396,9 @@
       ) {
         patch.proxyHealth = clone(DEFAULT_STATE.proxyHealth);
       }
+      if (typeof options.onBeforeSave === 'function') {
+        options.onBeforeSave(currentState.pacMods, restoredPacMods);
+      }
       return saveStatePatchNow(patch, currentState);
     });
 
